@@ -22,6 +22,55 @@ import pyshark
 import asyncio
 import pandas as pd
 
+# ── Telegram attribute labels (att field) ────────────────────────────────────
+_ATT_LABELS = {
+    0x00: 'Request',
+    0x01: 'Response',
+    0x02: 'ACK/NAK',
+}
+
+# ── SBUS command labels (cmd field) ──────────────────────────────────────────
+# Source: SAIA Burgess S-Bus Ethernet specification / Wireshark sbus dissector
+_CMD_LABELS = {
+    0x00: 'Read flag(s)',
+    0x01: 'Read input(s)',
+    0x02: 'Read flag(s)',
+    0x03: 'Read output(s)',
+    0x04: 'Read register(s)',
+    0x05: 'Read register(s)',
+    0x06: 'Read counter(s)',
+    0x07: 'Read display register',
+    0x08: 'Write flag(s)',
+    0x09: 'Write output(s)',
+    0x0a: 'Write counter flag(s)',
+    0x0b: 'Write flag(s)',
+    0x0c: 'Write counter(s)',
+    0x0d: 'Write display register',
+    0x0e: 'Write register(s)',
+    0x13: 'Read register(s)',
+    0x14: 'Read timer(s)',
+    0x17: 'Write timer(s)',
+}
+
+
+def _fmt_att(att_int):
+    """Format att as '0x00 Request', '0x01 Response', etc."""
+    if att_int is None:
+        return None
+    label = _ATT_LABELS.get(att_int, 'Unknown')
+    return f'0x{att_int:02x} {label}'
+
+
+def _fmt_cmd(cmd_raw):
+    """Format cmd as '0x02 Read flag(s)', '0x0e Write register(s)', etc."""
+    if cmd_raw is None:
+        return None
+    cmd_int = safe_int_from_str(cmd_raw)
+    if cmd_int is None:
+        return str(cmd_raw)
+    label = _CMD_LABELS.get(cmd_int, 'Unknown')
+    return f'0x{cmd_int:02x} {label}'
+
 
 def safe_int_from_str(s):
     if s is None:
@@ -93,7 +142,7 @@ def _get_udp_bytes(packet):
 def _data_from_sbus_layer(sbus):
     """Try all known Wireshark SBUS dissector field names for data values."""
     for fname in ('val32', 'bin_data', 'data_32', 'byte_value', 'data_byte', 'value', 'data'):
-        raw = getattr(sbus, fname, None)
+        raw = _sbus_get(sbus, fname)
         if raw is None:
             continue
         vals = []
@@ -102,6 +151,42 @@ def _data_from_sbus_layer(sbus):
         if vals:
             return vals
     return []
+
+
+def _search_nested(d, names):
+    """
+    Recursively search a tshark field dict (possibly nested) for a field
+    whose dotted-name suffix matches any of `names`.
+
+    tshark JSON nests fields that live inside a Wireshark sub-tree under a
+    plain-string key (e.g. "Ether-S-Bus header" → dict of sbus.* fields).
+    A flat search by suffix therefore misses them; recursion finds them.
+    """
+    for key, val in d.items():
+        if isinstance(val, dict):
+            result = _search_nested(val, names)
+            if result is not None:
+                return result
+        elif val is not None:
+            suffix = key.split('.')[-1]
+            if suffix in names:
+                return val
+    return None
+
+
+def _sbus_get(sbus, *names):
+    """
+    Robustly read a field from a pyshark sbus layer.
+    Tries direct attribute access first (fast path), then falls back to a
+    recursive search of _all_fields so fields inside Wireshark sub-trees
+    (e.g. 'sbus.sequence' inside 'Ether-S-Bus header') are still found.
+    """
+    for name in names:
+        v = getattr(sbus, name, None)
+        if v is not None:
+            return v
+    raw = getattr(sbus, '_all_fields', None) or {}
+    return _search_nested(raw, frozenset(names))
 
 
 # Commands that write binary flags (not 32-bit registers)
@@ -182,7 +267,18 @@ def parse_sbus_pcap(pcap_path, output_dir):
         asyncio.set_event_loop(loop)
     except Exception:
         loop = None
-    cap = pyshark.FileCapture(pcap_path, display_filter='sbus', use_json=True, keep_packets=False, eventloop=loop)
+    # -2 enables tshark two-pass analysis so that forward-reference "generated"
+    # fields (e.g. "Response in frame nr." on a request packet) are populated.
+    # Without -2, tshark fills in only backward references (response→request)
+    # because it hasn't seen the response yet when processing the request.
+    cap = pyshark.FileCapture(
+        pcap_path,
+        display_filter='sbus',
+        use_json=True,
+        keep_packets=False,
+        eventloop=loop,
+        custom_parameters=['-2'],
+    )
 
     rows = []
     parsed_index = 0
@@ -244,58 +340,65 @@ def parse_sbus_pcap(pcap_path, output_dir):
 
             sbus = packet.sbus
 
-            # Extract header fields (map to actual dissector names observed)
-            sequence = safe_int_from_str(getattr(sbus, 'sequence', None))
-            # dissector exposes attribute as 'att'
-            att_raw = getattr(sbus, 'att', None) or getattr(sbus, 'telegram_attribute', None)
-            att = safe_int_from_str(att_raw)
+            # All field reads go through _sbus_get which searches both pyshark
+            # attributes AND _all_fields, catching fields nested inside sub-trees
+            # (e.g. "Ether-S-Bus header") that plain getattr misses.
+            att = safe_int_from_str(
+                _sbus_get(sbus, 'att', 'telegram_attribute', 'attribut')
+            )
 
-            cmd = None
+            cmd_raw = None
             response_time_ms = None
-            request_in_frame = None
+            request_in_frame = None       # (responses only) frame of the matching request
+            response_in_frame = None      # (requests only)  frame of the matching response
+            first_request_in_frame = None # (repeated requests) frame of the original attempt
 
-            # cmd present for request (att == 0x00)
+            # ── Request (att == 0x00) ────────────────────────────────────────
             if att == 0x00:
-                cmd = getattr(sbus, 'cmd', None)
+                cmd_raw = _sbus_get(sbus, 'cmd', 'command')
                 base_address = safe_int_from_str(
-                    getattr(sbus, 'addr_RTC', None) or getattr(sbus, 'addr_IOF', None) or getattr(sbus, 'destination', None)
+                    _sbus_get(sbus, 'addr_RTC', 'addr_IOF', 'destination', 'addr')
                 )
-                # wcount_calculated = number of 32-bit values (Wireshark field name)
                 r_count = safe_int_from_str(
-                    getattr(sbus, 'wcount_calculated', None) or getattr(sbus, 'rcount_calculated', None) or
-                    getattr(sbus, 'rcount', None) or getattr(sbus, 'fio_count', None) or getattr(sbus, 'wcount', None)
+                    _sbus_get(sbus, 'wcount_calculated', 'rcount_calculated',
+                              'rcount', 'fio_count', 'wcount')
+                )
+                response_in_frame = safe_int_from_str(
+                    _sbus_get(sbus, 'response_in', 'response_frame', 'resp_frame')
+                )
+                first_request_in_frame = safe_int_from_str(
+                    _sbus_get(sbus, 'first_request_in', 'first_request_frame',
+                              'first_req_frame', 'firstrespin')
                 )
 
                 data_vector = _data_from_sbus_layer(sbus)
                 if not data_vector:
-                    data_vector = _data_from_raw_request(packet, r_count, cmd_raw=cmd)
+                    data_vector = _data_from_raw_request(packet, r_count, cmd_raw=cmd_raw)
 
-            # response (att == 0x01)
+            # ── Response (att == 0x01) ───────────────────────────────────────
             elif att == 0x01:
-                cmd = None
                 base_address = None
                 r_count = None
-                rt = getattr(sbus, 'response_time', None)
+                rt = _sbus_get(sbus, 'response_time', 'resp_time')
                 try:
                     response_time_ms = float(rt) * 1000.0 if rt is not None else None
                 except Exception:
                     response_time_ms = safe_int_from_str(rt)
                 request_in_frame = safe_int_from_str(
-                    getattr(sbus, 'response_to', None) or getattr(sbus, 'request_in', None)
+                    _sbus_get(sbus, 'response_to', 'request_in', 'req_frame')
                 )
 
                 data_vector = _data_from_sbus_layer(sbus)
                 if not data_vector:
                     data_vector = _data_from_raw_response(packet)
 
+            # ── ACK / NAK or unknown ─────────────────────────────────────────
             else:
-                # ACK/NAK or other att values: skip detailed extraction but record header
-                cmd = getattr(sbus, 'cmd', None)
+                cmd_raw = _sbus_get(sbus, 'cmd', 'command')
                 base_address = None
                 r_count = None
                 data_vector = []
 
-            # Only count as parsed if we at least have an attribute (att)
             if att is None:
                 continue
 
@@ -310,15 +413,23 @@ def parse_sbus_pcap(pcap_path, output_dir):
                 'transport_protocol': transport_proto,
                 'source_port': source_port,
                 'destination_port': destination_port,
-                'sequence': sequence,
-                'att': att,
-                'cmd': cmd,
+                # att: telegram direction — '0x00 Request', '0x01 Response', '0x02 ACK/NAK'
+                'att': _fmt_att(att),
+                # cmd: SBUS command with label — '0x02 Read flag(s)', '0x0e Write register(s)', …
+                'cmd': _fmt_cmd(cmd_raw),
+                # response_time_ms: PLC reply latency — only set for response packets
                 'response_time_ms': response_time_ms,
+                # request_in_frame: (responses) pckt_id of the matching request
                 'request_in_frame': request_in_frame,
+                # response_in_frame: (requests) pckt_id of the matching response
+                'response_in_frame': response_in_frame,
+                # first_request_in_frame: (repeated requests) pckt_id of the original attempt
+                'first_request_in_frame': first_request_in_frame,
+                # base_address: PLC register / flag / I-O base address accessed
                 'base_address': base_address,
+                # r_count: number of 32-bit register values or flags being accessed
                 'r_count': r_count,
                 'data_vector': data_vector,
-                'pcap_file': os.path.abspath(pcap_path)
             }
 
             rows.append(row)
@@ -329,6 +440,7 @@ def parse_sbus_pcap(pcap_path, output_dir):
             continue
 
     cap.close()
+    import gc; gc.collect()
 
     # Convert to DataFrame and write to Parquet
     if not rows:
@@ -349,11 +461,25 @@ def parse_sbus_pcap(pcap_path, output_dir):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Parse S-Bus packets from a PCAP and export Parquet rows')
-    parser.add_argument('--pcap', default=r"D:\recording\1-recording\data\new\capture_2026-03-26_13-50-13.pcap")
+    import gc
+    import glob
+
+    parser = argparse.ArgumentParser(description='Parse S-Bus packets from a PCAP directory and export one Parquet per file')
+    parser.add_argument('--pcapdir', default=r"D:\recording\1-recording\data\new",
+                        help='Directory containing .pcap files to process')
     parser.add_argument('--outdir', default=r"d:\tomer\SCADA-Anomaly-Detection\src\sbus-packets\data")
     args = parser.parse_args()
 
-    out = parse_sbus_pcap(args.pcap, args.outdir)
-    if out:
-        print('Done.')
+    pcap_files = sorted(glob.glob(os.path.join(args.pcapdir, '*.pcap')))
+    if not pcap_files:
+        print(f"No .pcap files found in: {args.pcapdir}")
+    else:
+        print(f"Found {len(pcap_files)} pcap file(s). Starting...")
+        for i, pcap_path in enumerate(pcap_files, 1):
+            print(f"[{i}/{len(pcap_files)}] {os.path.basename(pcap_path)}")
+            try:
+                parse_sbus_pcap(pcap_path, args.outdir)
+            except Exception as e:
+                print(f"  ERROR: {e}")
+            gc.collect()
+        print('All done.')
